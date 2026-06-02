@@ -6,6 +6,10 @@ import sys
 import cv2
 import face_recognition
 
+FACE_MATCH_THRESHOLD = 0.5
+LABEL_Y_OFFSET = 10
+MIN_LABEL_Y = 20
+
 
 def load_known_face_encoding(image_path: Path):
     """Load and encode Manoj's face from the reference image."""
@@ -55,7 +59,7 @@ def main():
                 # Compare each live encoding against Manoj's known encoding.
                 matches = face_recognition.compare_faces([manoj_encoding], face_encoding)
                 distance = face_recognition.face_distance([manoj_encoding], face_encoding)[0]
-                is_match = matches[0] and distance < 0.5
+                is_match = matches[0] and distance < FACE_MATCH_THRESHOLD
 
                 if is_match:
                     color = (0, 255, 0)  # Green
@@ -68,7 +72,7 @@ def main():
                 cv2.putText(
                     frame,
                     label,
-                    (left, max(top - 10, 20)),
+                    (left, max(top - LABEL_Y_OFFSET, MIN_LABEL_Y)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     color,
