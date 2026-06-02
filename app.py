@@ -57,9 +57,9 @@ def main():
 
             for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
                 # Compare each live encoding against Manoj's known encoding.
-                matches = face_recognition.compare_faces([manoj_encoding], face_encoding)
-                distance = face_recognition.face_distance([manoj_encoding], face_encoding)[0]
-                is_match = matches[0] and distance < FACE_MATCH_THRESHOLD
+                is_match = face_recognition.compare_faces(
+                    [manoj_encoding], face_encoding, tolerance=FACE_MATCH_THRESHOLD
+                )[0]
 
                 if is_match:
                     color = (0, 255, 0)  # Green
@@ -89,7 +89,5 @@ def main():
         cv2.destroyAllWindows()
 
     return 0
-
-
 if __name__ == "__main__":
     sys.exit(main())

@@ -49,7 +49,7 @@ manoj.jpg
 in the repository root:
 
 ```text
-face_detection_model/manoj.jpg
+<repository-root>/manoj.jpg
 ```
 
 The application loads this image at startup and extracts Manoj's face encoding.
