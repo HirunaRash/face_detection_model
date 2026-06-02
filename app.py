@@ -1,19 +1,78 @@
 import cv2
 
 
+def detect_faces(cascade, gray_frame):
+    faces = cascade.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.05,
+        minNeighbors=3,
+        minSize=(30, 30),
+    )
+    return [tuple(face) for face in faces]
+
+
+def box_iou(box_a, box_b):
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+
+    ax2 = ax1 + aw
+    ay2 = ay1 + ah
+    bx2 = bx1 + bw
+    by2 = by1 + bh
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = aw * ah
+    area_b = bw * bh
+    union_area = area_a + area_b - inter_area
+
+    if union_area == 0:
+        return 0.0
+
+    return inter_area / union_area
+
+
+def merge_overlapping_boxes(boxes, iou_threshold=0.3):
+    if not boxes:
+        return []
+
+    ordered_boxes = sorted(boxes, key=lambda box: box[2] * box[3], reverse=True)
+    kept_boxes = []
+
+    for candidate in ordered_boxes:
+        if all(box_iou(candidate, kept) < iou_threshold for kept in kept_boxes):
+            kept_boxes.append(candidate)
+
+    return kept_boxes
+
+
 def main():
-    face_cascade = cv2.CascadeClassifier(
+    frontal_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    profile_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_profileface.xml"
     )
 
-    if face_cascade.empty():
+    if frontal_cascade.empty():
+        raise RuntimeError("Failed to load Haar cascade frontal face classifier.")
+    if profile_cascade.empty():
         raise RuntimeError("Failed to load Haar cascade profile face classifier.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Could not open the webcam.")
 
-    window_name = "Real-Time Side-Profile Face Detection"
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    window_name = "Real-Time Face Detection"
 
     try:
         while True:
@@ -23,33 +82,18 @@ def main():
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frame_height, frame_width = gray.shape
-            
-            # Detect left-facing profiles in the normal frame
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(30, 30),
-            )
+            detections = []
 
-            # Draw left-facing profiles
-            for (x, y, w, h) in faces:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            detections.extend(detect_faces(frontal_cascade, gray))
+            detections.extend(detect_faces(profile_cascade, gray))
 
-            # Flip the grayscale frame horizontally to detect right-facing profiles
             gray_flipped = cv2.flip(gray, 1)
-            faces_flipped = face_cascade.detectMultiScale(
-                gray_flipped,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(30, 30),
-            )
-
-            # Convert flipped coordinates back to original frame space and draw
-            for (x, y, w, h) in faces_flipped:
-                # Transform x coordinate from flipped frame to original frame
+            for (x, y, w, h) in detect_faces(profile_cascade, gray_flipped):
                 x_original = frame_width - x - w
-                cv2.rectangle(frame, (x_original, y), (x_original + w, y + h), (0, 255, 0), 2)
+                detections.append((x_original, y, w, h))
+
+            for (x, y, w, h) in merge_overlapping_boxes(detections):
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
             cv2.imshow(window_name, frame)
 
