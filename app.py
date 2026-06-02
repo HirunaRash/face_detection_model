@@ -3,7 +3,7 @@ import cv2
 
 def main():
     face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cv2.data.haarcascades + "haarcascade_profileface.xml"
     )
 
     if face_cascade.empty():
