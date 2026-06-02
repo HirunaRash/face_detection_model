@@ -89,5 +89,7 @@ def main():
         cv2.destroyAllWindows()
 
     return 0
+
+
 if __name__ == "__main__":
     sys.exit(main())
