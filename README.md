@@ -53,6 +53,7 @@ in the repository root:
 ```
 
 The application loads this image at startup and extracts Manoj's face encoding.
+For best results, use a front-facing image with good lighting and one clearly visible face.
 
 ## Run the Application
 

@@ -55,7 +55,9 @@ def main():
             face_locations = face_recognition.face_locations(rgb_frame)
             face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            for (face_top, face_right, face_bottom, face_left), face_encoding in zip(
+                face_locations, face_encodings
+            ):
                 # Compare each live encoding against Manoj's known encoding.
                 is_match = face_recognition.compare_faces(
                     [manoj_encoding], face_encoding, tolerance=FACE_MATCH_THRESHOLD
@@ -68,11 +70,11 @@ def main():
                     color = (0, 0, 255)  # Red
                     label = "Unknown Person"
 
-                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                cv2.rectangle(frame, (face_left, face_top), (face_right, face_bottom), color, 2)
                 cv2.putText(
                     frame,
                     label,
-                    (left, max(top - LABEL_Y_OFFSET, MIN_LABEL_Y)),
+                    (face_left, max(face_top - LABEL_Y_OFFSET, MIN_LABEL_Y)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     color,
