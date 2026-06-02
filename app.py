@@ -39,7 +39,32 @@ def box_iou(box_a, box_b):
     return inter_area / union_area
 
 
-def merge_overlapping_boxes(boxes, iou_threshold=0.3):
+def overlap_ratio(box_a, box_b):
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+
+    ax2 = ax1 + aw
+    ay2 = ay1 + ah
+    bx2 = bx1 + bw
+    by2 = by1 + bh
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    smaller_area = min(aw * ah, bw * bh)
+    if smaller_area == 0:
+        return 0.0
+
+    return inter_area / smaller_area
+
+
+def merge_overlapping_boxes(boxes, iou_threshold=0.2, overlap_threshold=0.65):
     if not boxes:
         return []
 
@@ -47,10 +72,24 @@ def merge_overlapping_boxes(boxes, iou_threshold=0.3):
     kept_boxes = []
 
     for candidate in ordered_boxes:
-        if all(box_iou(candidate, kept) < iou_threshold for kept in kept_boxes):
+        if all(
+            box_iou(candidate, kept) < iou_threshold
+            and overlap_ratio(candidate, kept) < overlap_threshold
+            for kept in kept_boxes
+        ):
             kept_boxes.append(candidate)
 
     return kept_boxes
+
+
+def open_camera():
+    for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(0, backend)
+        if cap.isOpened():
+            return cap
+        cap.release()
+
+    return cv2.VideoCapture(0)
 
 
 def main():
@@ -66,7 +105,7 @@ def main():
     if profile_cascade.empty():
         raise RuntimeError("Failed to load Haar cascade profile face classifier.")
 
-    cap = cv2.VideoCapture(0)
+    cap = open_camera()
     if not cap.isOpened():
         raise RuntimeError("Could not open the webcam.")
 
