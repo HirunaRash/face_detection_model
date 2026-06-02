@@ -45,7 +45,7 @@ def main():
                 break
 
             # Convert BGR (OpenCV) frame to RGB for face_recognition.
-            rgb_frame = frame[:, :, ::-1]
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Detect faces and compute their encodings in current frame.
             face_locations = face_recognition.face_locations(rgb_frame)
@@ -53,7 +53,9 @@ def main():
 
             for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
                 # Compare each live encoding against Manoj's known encoding.
-                is_match = face_recognition.compare_faces([manoj_encoding], face_encoding)[0]
+                matches = face_recognition.compare_faces([manoj_encoding], face_encoding)
+                distance = face_recognition.face_distance([manoj_encoding], face_encoding)[0]
+                is_match = matches[0] and distance < 0.5
 
                 if is_match:
                     color = (0, 255, 0)  # Green
