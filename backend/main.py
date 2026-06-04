@@ -1,9 +1,12 @@
-import os
 import re
+import json
+import queue
 import threading
 import time
 import math
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Generator
+
 import numpy as np
 import cv2
 import face_recognition
@@ -13,23 +16,34 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
+# ==========================================
+# CONFIGURATION
+# ==========================================
 SUPABASE_URL = "https://pfexlwikctosunnulxkp.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBmZXhsd2lrY3Rvc3VubnVseGtwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA0NjU3NzIsImV4cCI6MjA5NjA0MTc3Mn0.GqfBZSRBOPWh6oKUALXo2nvym9XkOZEmsK0VldeHzAA"
-SUPABASE_BUCKET = "face-signatures"
-DATABASE_TABLE = "employees"
-ATTENDANCE_TABLE = "attendance_logs"
-ATTENDANCE_COOLDOWN_SECONDS = 300
-FACE_IMAGE_SIZE = (200, 200)
-STREAM_SCALE = 0.5
-FACE_MATCH_TOLERANCE = 0.6  
-HUD_COLOR = (255, 191, 0)
+SUPABASE_BUCKET    = "face-signatures"
+EMPLOYEES_TABLE    = "employees"
+ATTENDANCE_TABLE   = "attendance_logs"
 
+CAPTURE_TARGET     = 100          # face images captured per registration
+CAPTURE_TIMEOUT    = 60           # max seconds to spend capturing (never gets stuck)
+FACE_IMG_SIZE      = (160, 160)
+STREAM_SCALE       = 0.5          # downscale for recognition speed
+MATCH_TOLERANCE    = 0.5          # lower = stricter match
+COOLDOWN_SECONDS   = 300          # minimum seconds between two logs for same person
+HUD_COLOR          = (0, 230, 118)
+
+# ==========================================
+# PYDANTIC SCHEMAS
+# ==========================================
 class RegisterRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
+    name:  str = Field(..., min_length=1, max_length=100)
     title: str = Field(..., min_length=1, max_length=100)
 
-app = FastAPI(title="Face Recognition Attendance API", version="1.0.0")
-
+# ==========================================
+# FASTAPI APP
+# ==========================================
+app = FastAPI(title="BioID Attendance API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,451 +52,520 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# SUPABASE CLIENT
+# ==========================================
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-lbph_recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-model_lock = threading.RLock()
-camera_lock = threading.RLock()
-attendance_lock = threading.RLock()
-
-# Shared background stream container to solve the hardware resource locking conflict
-current_live_frame: Optional[np.ndarray] = None
-
-last_logged_time: Dict[int, float] = {}
-id_to_name: Dict[int, str] = {}
-id_to_title: Dict[int, str] = {}
-known_face_encodings: List[np.ndarray] = []
-known_face_ids: List[int] = []
-
+# ==========================================
+# HAAR CASCADE
+# ==========================================
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 if face_cascade.empty():
-    raise RuntimeError("Failed to load Haar cascade face detector.")
+    raise RuntimeError("Could not load Haar cascade XML.")
 
-def clean_text(value: str) -> str:
-    cleaned = value.strip()
-    cleaned = re.sub(r"[<>:\"/\\|?*]+", "_", cleaned)
-    cleaned = re.sub(r"\s+", "_", cleaned)
-    return cleaned.strip("._ ")
+# ==========================================
+# THREAD-SAFE GLOBALS
+# ==========================================
+_frame_lock      = threading.Lock()
+_model_lock      = threading.RLock()
+_attendance_lock = threading.Lock()
+_sse_lock        = threading.Lock()
 
-def clean_display_text(value: str) -> str:
-    cleaned = value.strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
+current_frame: Optional[np.ndarray] = None
+server_alive   = True
 
-def choose_largest_face(faces: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    if len(faces) == 0:
-        return None
-    return max(faces, key=lambda face: face[2] * face[3])
+known_encodings: List[np.ndarray] = []
+known_ids:       List[int]         = []
+id_to_name:      Dict[int, str]    = {}
+id_to_title:     Dict[int, str]    = {}
+last_logged:     Dict[int, float]  = {}
 
-def face_location_area(location: Tuple[int, int, int, int]) -> int:
-    top, right, bottom, left = location
+sse_clients: List[queue.Queue] = []
+
+# ==========================================
+# REGISTRATION STATUS (for progress SSE)
+# ==========================================
+reg_status: Dict = {"active": False, "captured": 0, "target": CAPTURE_TARGET, "done": False, "error": ""}
+reg_lock = threading.Lock()
+
+# ==========================================
+# HELPERS
+# ==========================================
+def slugify(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r"[^\w\s-]", "", t)
+    t = re.sub(r"\s+", "_", t)
+    return t.strip("-_")
+
+def face_area(loc: Tuple) -> int:
+    top, right, bottom, left = loc
     return max(0, right - left) * max(0, bottom - top)
 
-def decode_image_bytes(image_bytes: bytes) -> Optional[np.ndarray]:
-    if not image_bytes:
-        return None
-    buffer = np.frombuffer(image_bytes, dtype=np.uint8)
-    return cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+def decode_bytes(data: bytes) -> Optional[np.ndarray]:
+    buf = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
-def extract_face_crop_and_encoding(image_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(image_rgb, model="hog")
-    if not face_locations:
-        return None, None
+def broadcast(payload: dict) -> None:
+    msg = json.dumps(payload)
+    with _sse_lock:
+        dead = []
+        for q in sse_clients:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            sse_clients.remove(q)
 
-    selected_location = max(face_locations, key=face_location_area)
-    encodings = face_recognition.face_encodings(image_rgb, known_face_locations=[selected_location])
-    if not encodings:
-        return None, None
-
-    top, right, bottom, left = selected_location
-    gray_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    face_crop = gray_image[top:bottom, left:right]
-    if face_crop.size == 0:
-        return None, None
-
-    face_crop = cv2.resize(face_crop, FACE_IMAGE_SIZE)
-    return face_crop, encodings[0]
-
-def load_face_profile_from_bucket(employee_id: int, employee_name: str) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    bucket = supabase.storage.from_(SUPABASE_BUCKET)
-    folder_name = clean_text(employee_name)
-
-    lbph_samples: List[np.ndarray] = []
-    face_encodings: List[np.ndarray] = []
-
-    for index in range(1, 15): 
-        object_path = f"{folder_name}/face_{index}.jpg"
-        try:
-            image_bytes = bucket.download(object_path)
-        except Exception:
-            continue
-
-        if isinstance(image_bytes, (bytearray, memoryview)):
-            image_bytes = bytes(image_bytes)
-
-        image_bgr = decode_image_bytes(image_bytes)
-        if image_bgr is None:
-            continue
-
-        face_crop, face_encoding = extract_face_crop_and_encoding(image_bgr)
-        if face_crop is not None:
-            lbph_samples.append(face_crop)
-        if face_encoding is not None:
-            face_encodings.append(face_encoding)
-
-    return lbph_samples, face_encodings
-
-def sync_employee_models() -> None:
-    global lbph_recognizer, id_to_name, id_to_title, known_face_encodings, known_face_ids
-    print("Starting background employee model synchronization...")
-    try:
-        response = supabase.table(DATABASE_TABLE).select("id,name,title").execute()
-        employees = response.data or []
-    except Exception as e:
-        print(f"Failed to fetch dataset from Supabase on launch: {e}")
-        return
-
-    if not employees:
-        print("No registered employees found.")
-        with model_lock:
-            id_to_name = {}
-            id_to_title = {}
-            known_face_encodings = []
-            known_face_ids = []
-        return
-
-    new_id_to_name: Dict[int, str] = {}
-    new_id_to_title: Dict[int, str] = {}
-    training_images: List[np.ndarray] = []
-    training_labels: List[int] = []
-    profile_encodings: List[np.ndarray] = []
-    profile_ids: List[int] = []
-
-    for employee in employees:
-        employee_id = int(employee["id"])
-        employee_name = clean_display_text(str(employee.get("name", "")))
-        employee_title = clean_display_text(str(employee.get("title", "")))
-
-        if not employee_name:
-            continue
-
-        new_id_to_name[employee_id] = employee_name
-        new_id_to_title[employee_id] = employee_title
-
-        lbph_samples, face_encodings = load_face_profile_from_bucket(employee_id, employee_name)
-        for sample in lbph_samples:
-            training_images.append(sample)
-            training_labels.append(employee_id)
-        if face_encodings:
-            averaged_encoding = np.mean(np.stack(face_encodings, axis=0), axis=0)
-            profile_encodings.append(averaged_encoding)
-            profile_ids.append(employee_id)
-
-    with model_lock:
-        id_to_name = new_id_to_name
-        id_to_title = new_id_to_title
-        known_face_encodings = profile_encodings
-        known_face_ids = profile_ids
-        lbph_recognizer = cv2.face.LBPHFaceRecognizer_create()
-        if training_images:
-            lbph_recognizer.train(training_images, np.array(training_labels, dtype=np.int32))
-    print("Employee models successfully synced.")
-
-@app.on_event("startup")
-def on_startup() -> None:
-    threading.Thread(target=sync_employee_models, daemon=True).start()
-
-def build_employee_display_name(employee_id: int) -> str:
-    name = id_to_name.get(employee_id, "").strip()
-    title = id_to_title.get(employee_id, "").strip()
-    if title and name:
-        return f"Hi {title} - {name}"
-    if name:
-        return f"Hi {name}"
-    return f"Hi Employee {employee_id}"
-
-def queue_attendance_log(employee_id: int) -> None:
-    now = time.time()
-    with attendance_lock:
-        last_time = last_logged_time.get(employee_id, 0.0)
-        if now - last_time < ATTENDANCE_COOLDOWN_SECONDS:
-            return
-        last_logged_time[employee_id] = now
-
-    def _insert_log() -> None:
-        try:
-            supabase.table(ATTENDANCE_TABLE).insert({"employee_id": employee_id}).execute()
-        except Exception as exc:
-            print(f"Attendance insert failed for employee {employee_id}: {exc}")
-
-    threading.Thread(target=_insert_log, daemon=True).start()
-
-def match_employee(face_encoding: np.ndarray) -> Tuple[Optional[int], bool, float]:
-    with model_lock:
-        local_encodings = list(known_face_encodings)
-        local_ids = list(known_face_ids)
-
-    if not local_encodings:
-        return None, False, 1.0
-
-    distances = face_recognition.face_distance(local_encodings, face_encoding)
-    matches = face_recognition.compare_faces(local_encodings, face_encoding, tolerance=FACE_MATCH_TOLERANCE)
-
-    matched_indexes = [index for index, matched in enumerate(matches) if matched]
-    if matched_indexes:
-        best_index = min(matched_indexes, key=lambda index: distances[index])
-        best_distance = float(distances[best_index])
-        return local_ids[best_index], True, best_distance
-
-    if len(distances) > 0:
-        best_index = int(np.argmin(distances))
-        return None, False, float(distances[best_index])
-    return None, False, 1.0
-
-def clamp_box(box: Tuple[int, int, int, int], frame_width: int, frame_height: int) -> Tuple[int, int, int, int]:
+def clamp(box, fw, fh):
     x, y, w, h = box
-    x = max(0, min(x, frame_width - 1))
-    y = max(0, min(y, frame_height - 1))
-    w = max(1, min(w, frame_width - x))
-    h = max(1, min(h, frame_height - y))
+    x = max(0, min(x, fw - 1))
+    y = max(0, min(y, fh - 1))
+    w = max(1, min(w, fw - x))
+    h = max(1, min(h, fh - y))
     return x, y, w, h
 
-def location_to_box(location: Tuple[int, int, int, int], scale_factor: float) -> Tuple[int, int, int, int]:
-    top, right, bottom, left = location
-    x = int(round(left * scale_factor))
-    y = int(round(top * scale_factor))
-    w = int(round((right - left) * scale_factor))
-    h = int(round((bottom - top) * scale_factor))
-    return x, y, w, h
-
-def average_box_history(box_history: List[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
-    if not box_history:
-        return None
-    x_mean = int(round(np.mean([box[0] for box in box_history])))
-    y_mean = int(round(np.mean([box[1] for box in box_history])))
-    w_mean = int(round(np.mean([box[2] for box in box_history])))
-    h_mean = int(round(np.mean([box[3] for box in box_history])))
-    return x_mean, y_mean, w_mean, h_mean
-
-def draw_corner_brackets(frame: np.ndarray, x: int, y: int, w: int, h: int, color=HUD_COLOR, thickness: int = 2) -> None:
-    corner_length = max(12, min(w, h) // 5)
-    cv2.line(frame, (x, y), (x + corner_length, y), color, thickness)
-    cv2.line(frame, (x, y), (x, y + corner_length), color, thickness)
-    cv2.line(frame, (x + w, y), (x + w - corner_length, y), color, thickness)
-    cv2.line(frame, (x + w, y), (x + w, y + corner_length), color, thickness)
-    cv2.line(frame, (x, y + h), (x + corner_length, y + h), color, thickness)
-    cv2.line(frame, (x, y + h), (x, y + h - corner_length), color, thickness)
-    cv2.line(frame, (x + w, y + h), (x + w - corner_length, y + h), color, thickness)
-    cv2.line(frame, (x + w, y + h), (x + w, y + h - corner_length), color, thickness)
-
-def draw_reticle(frame: np.ndarray, x: int, y: int, w: int, h: int, color=HUD_COLOR) -> None:
-    center_x = x + w // 2
-    center_y = y + h // 2
-    reticle_size = max(4, min(w, h) // 12)
-    cv2.circle(frame, (center_x, center_y), 2, color, -1)
-    cv2.line(frame, (center_x - reticle_size, center_y), (center_x + reticle_size, center_y), color, 1)
-    cv2.line(frame, (center_x, center_y - reticle_size), (center_x, center_y + reticle_size), color, 1)
-
-def draw_scan_laser(frame: np.ndarray, x: int, y: int, w: int, h: int, frame_tick: int, color=HUD_COLOR) -> None:
-    scan_margin = max(6, h // 10)
-    scan_top = y + scan_margin
-    scan_bottom = y + h - scan_margin
-    if scan_bottom <= scan_top:
-        scan_top = y
-        scan_bottom = y + h
-    travel = max(1, scan_bottom - scan_top)
-    phase = 0.5 + 0.5 * math.sin(frame_tick * 0.08)
-    scan_y = scan_top + int(travel * phase)
-    cv2.line(frame, (x + 4, scan_y), (x + w - 4, scan_y), color, 1)
-
-def draw_telemetry(frame: np.ndarray, x: int, y: int, w: int, h: int, identity_text: str, color=HUD_COLOR) -> None:
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.42
-    thickness = 1
-    cv2.putText(frame, identity_text, (x, max(16, y - 24)), font, scale, color, thickness, cv2.LINE_AA)
-    cv2.putText(frame, f"X_COORD: {x}", (x, y + h + 16), font, scale, color, thickness, cv2.LINE_AA)
-    cv2.putText(frame, f"Y_COORD: {y}", (x, y + h + 31), font, scale, color, thickness, cv2.LINE_AA)
-    cv2.putText(frame, "SYS_LOCK: ACTIVE", (x, y + h + 46), font, scale, color, thickness, cv2.LINE_AA)
-
-def draw_hud(frame: np.ndarray, box: Tuple[int, int, int, int], frame_tick: int, identity_text: str) -> None:
-    x, y, w, h = box
-    draw_corner_brackets(frame, x, y, w, h)
-    draw_scan_laser(frame, x, y, w, h, frame_tick)
-    draw_reticle(frame, x, y, w, h)
-    draw_telemetry(frame, x, y, w, h, identity_text)
-
-def select_primary_face(frame_locations: List[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
-    if not frame_locations:
-        return None
-    return max(frame_locations, key=face_location_area)
-
-def build_frame_stream() -> bytes:
-    global current_live_frame
-    with camera_lock:
+# ==========================================
+# CAMERA WORKER (background thread)
+# ==========================================
+def camera_worker():
+    global current_frame, server_alive
+    print("[Camera] Starting camera worker...")
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
         cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            return
+    if not cap.isOpened():
+        print("[Camera] ERROR: Cannot open webcam.")
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    print("[Camera] Webcam opened successfully.")
+    while server_alive:
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            with _frame_lock:
+                current_frame = frame
+        else:
+            time.sleep(0.005)
+    cap.release()
+    print("[Camera] Released webcam.")
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+# ==========================================
+# MODEL SYNC  (load all employees from bucket)
+# ==========================================
+def sync_models() -> None:
+    global known_encodings, known_ids, id_to_name, id_to_title
+    print("[Sync] Syncing employee face models...")
+    try:
+        rows = supabase.table(EMPLOYEES_TABLE).select("id,name,title").execute().data or []
+    except Exception as e:
+        print(f"[Sync] DB fetch failed: {e}")
+        return
 
-        box_history: List[Tuple[int, int, int, int]] = []
-        last_box: Optional[Tuple[int, int, int, int]] = None
-        last_identity_text = "[ TARGET_UNKNOWN: UNKNOWN ]"
-        missed_frames = 0
-        frame_tick = 0
+    new_enc, new_ids, new_names, new_titles = [], [], {}, {}
 
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+    for emp in rows:
+        eid   = int(emp["id"])
+        ename = emp.get("name", "").strip()
+        etitle= emp.get("title", "").strip()
+        if not ename:
+            continue
+        new_names[eid]  = ename
+        new_titles[eid] = etitle
 
-                # Populates global memory so registration pulls instantly from here
-                current_live_frame = frame.copy()
+        folder   = slugify(ename)
+        bucket   = supabase.storage.from_(SUPABASE_BUCKET)
+        encodings_for_emp = []
 
-                small_frame = cv2.resize(frame, (0, 0), fx=STREAM_SCALE, fy=STREAM_SCALE)
-                rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_small, model="hog")
-                face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
-
-                candidate_box: Optional[Tuple[int, int, int, int]] = None
-                candidate_identity_text = "[ TARGET_UNKNOWN: UNKNOWN ]"
-
-                if face_locations and face_encodings:
-                    primary_location = select_primary_face(face_locations)
-                    if primary_location is not None:
-                        primary_index = face_locations.index(primary_location)
-                        face_encoding = face_encodings[primary_index]
-                        employee_id, is_match, confidence = match_employee(face_encoding)
-
-                        if is_match and employee_id is not None:
-                            candidate_identity_text = f"[ AUTHENTICATED: {build_employee_display_name(employee_id)} ]"
-                            queue_attendance_log(employee_id)
-                        else:
-                            candidate_identity_text = "[ TARGET_UNKNOWN: UNKNOWN ]"
-
-                        candidate_box = clamp_box(
-                            location_to_box(primary_location, scale_factor=1.0 / STREAM_SCALE),
-                            frame.shape[1],
-                            frame.shape[0],
-                        )
-
-                if candidate_box is not None:
-                    box_history.append(candidate_box)
-                    if len(box_history) > 8:
-                        box_history.pop(0)
-                    last_box = average_box_history(box_history)
-                    last_identity_text = candidate_identity_text
-                    missed_frames = 0
-                else:
-                    missed_frames += 1
-                    if missed_frames > 15:
-                        box_history.clear()
-                        last_box = None
-                        last_identity_text = "[ TARGET_UNKNOWN: UNKNOWN ]"
-
-                if last_box is not None:
-                    x, y, w, h = clamp_box(last_box, frame.shape[1], frame.shape[0])
-                    draw_hud(frame, (x, y, w, h), frame_tick, last_identity_text)
-
-                success, jpeg_buffer = cv2.imencode(".jpg", frame)
-                if not success:
+        for idx in range(1, CAPTURE_TARGET + 1):
+            path = f"{folder}/face_{idx}.jpg"
+            try:
+                raw = bucket.download(path)
+                if isinstance(raw, (bytearray, memoryview)):
+                    raw = bytes(raw)
+                img = decode_bytes(raw)
+                if img is None:
                     continue
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                locs = face_recognition.face_locations(rgb, model="hog")
+                encs = face_recognition.face_encodings(rgb, locs)
+                if encs:
+                    encodings_for_emp.append(encs[0])
+            except Exception:
+                continue
 
-                frame_bytes = jpeg_buffer.tobytes()
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-                )
-                frame_tick += 1
-        finally:
-            cap.release()
+        if encodings_for_emp:
+            avg = np.mean(np.stack(encodings_for_emp, axis=0), axis=0)
+            new_enc.append(avg)
+            new_ids.append(eid)
+            print(f"[Sync] Loaded {len(encodings_for_emp)} frames for '{ename}' (id={eid})")
 
-@app.get("/api/stream")
-def stream_webcam() -> StreamingResponse:
+    with _model_lock:
+        known_encodings = new_enc
+        known_ids       = new_ids
+        id_to_name      = new_names
+        id_to_title     = new_titles
+
+    print(f"[Sync] Done. {len(new_enc)} employee(s) loaded.")
+
+# ==========================================
+# STARTUP / SHUTDOWN
+# ==========================================
+@app.on_event("startup")
+def on_startup():
+    threading.Thread(target=camera_worker, daemon=True).start()
+    threading.Thread(target=sync_models,   daemon=True).start()
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global server_alive
+    server_alive = False
+
+# ==========================================
+# ATTENDANCE LOGGING
+# ==========================================
+def log_attendance(emp_id: int) -> None:
+    now = time.time()
+    with _attendance_lock:
+        if now - last_logged.get(emp_id, 0) < COOLDOWN_SECONDS:
+            return
+        last_logged[emp_id] = now
+
+    name  = id_to_name.get(emp_id, "Unknown")
+    title = id_to_title.get(emp_id, "")
+    ts    = datetime.now().strftime("%I:%M:%S %p")
+
+    def _insert():
+        try:
+            supabase.table(ATTENDANCE_TABLE).insert({"employee_id": emp_id}).execute()
+        except Exception as e:
+            print(f"[Attendance] Insert failed: {e}")
+        broadcast({"name": name, "title": title, "time": ts})
+
+    threading.Thread(target=_insert, daemon=True).start()
+
+# ==========================================
+# FACE MATCHING
+# ==========================================
+def match_face(encoding: np.ndarray) -> Tuple[Optional[int], float]:
+    with _model_lock:
+        encs = list(known_encodings)
+        ids  = list(known_ids)
+    if not encs:
+        return None, 1.0
+    dists   = face_recognition.face_distance(encs, encoding)
+    matches = face_recognition.compare_faces(encs, encoding, tolerance=MATCH_TOLERANCE)
+    hits    = [i for i, m in enumerate(matches) if m]
+    if hits:
+        best = min(hits, key=lambda i: dists[i])
+        return ids[best], float(dists[best])
+    return None, float(np.min(dists))
+
+# ==========================================
+# HUD DRAWING
+# ==========================================
+def draw_hud(frame, x, y, w, h, label, tick):
+    c   = HUD_COLOR
+    cl  = max(12, min(w, h) // 5)
+    # corner brackets
+    for (px, py, dx, dy) in [(x,y,1,0),(x,y,0,1),(x+w,y,-1,0),(x+w,y,0,1),
+                              (x,y+h,1,0),(x,y+h,0,-1),(x+w,y+h,-1,0),(x+w,y+h,0,-1)]:
+        cv2.line(frame, (px, py), (px + dx*cl, py + dy*cl), c, 2)
+    # scan laser
+    margin = max(6, h // 10)
+    top_s, bot_s = y + margin, y + h - margin
+    if bot_s > top_s:
+        phase  = 0.5 + 0.5 * math.sin(tick * 0.1)
+        scan_y = top_s + int((bot_s - top_s) * phase)
+        cv2.line(frame, (x + 4, scan_y), (x + w - 4, scan_y), c, 1)
+    # reticle
+    cx, cy = x + w // 2, y + h // 2
+    rs = max(5, min(w, h) // 10)
+    cv2.circle(frame, (cx, cy), 2, c, -1)
+    cv2.line(frame, (cx - rs, cy), (cx + rs, cy), c, 1)
+    cv2.line(frame, (cx, cy - rs), (cx, cy + rs), c, 1)
+    # label
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(frame, label, (x, max(16, y - 10)), font, 0.45, c, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"X:{x} Y:{y}", (x, y + h + 16), font, 0.38, c, 1, cv2.LINE_AA)
+
+# ==========================================
+# MJPEG STREAM GENERATOR
+# ==========================================
+def frame_generator(recognition: bool = False) -> Generator[bytes, None, None]:
+    box_hist: List[Tuple] = []
+    last_box  = None
+    last_label= "SCANNING..."
+    missed    = 0
+    tick      = 0
+
+    while server_alive:
+        with _frame_lock:
+            frame = current_frame.copy() if current_frame is not None else None
+
+        if frame is None:
+            time.sleep(0.02)
+            continue
+
+        if recognition:
+            small  = cv2.resize(frame, (0, 0), fx=STREAM_SCALE, fy=STREAM_SCALE)
+            rgb_sm = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            locs   = face_recognition.face_locations(rgb_sm, model="hog")
+            encs   = face_recognition.face_encodings(rgb_sm, locs)
+
+            new_box   = None
+            new_label = "[ UNKNOWN ]"
+
+            if locs and encs:
+                best_loc = max(locs, key=face_area)
+                idx      = locs.index(best_loc)
+                emp_id, dist = match_face(encs[idx])
+
+                if emp_id is not None:
+                    name  = id_to_name.get(emp_id, "?")
+                    title = id_to_title.get(emp_id, "")
+                    new_label = f"[ {name} | {title} ]"
+                    log_attendance(emp_id)
+
+                top, right, bottom, left = best_loc
+                sf = 1.0 / STREAM_SCALE
+                bx = int(left * sf)
+                by = int(top  * sf)
+                bw = int((right - left) * sf)
+                bh = int((bottom - top) * sf)
+                new_box = clamp((bx, by, bw, bh), frame.shape[1], frame.shape[0])
+
+            if new_box:
+                box_hist.append(new_box)
+                if len(box_hist) > 6:
+                    box_hist.pop(0)
+                xs = [b[0] for b in box_hist]
+                ys = [b[1] for b in box_hist]
+                ws = [b[2] for b in box_hist]
+                hs = [b[3] for b in box_hist]
+                last_box   = (int(np.mean(xs)), int(np.mean(ys)),
+                               int(np.mean(ws)), int(np.mean(hs)))
+                last_label = new_label
+                missed     = 0
+            else:
+                missed += 1
+                if missed > 20:
+                    box_hist.clear()
+                    last_box   = None
+                    last_label = "SCANNING..."
+
+            if last_box:
+                x, y, w, h = clamp(last_box, frame.shape[1], frame.shape[0])
+                draw_hud(frame, x, y, w, h, last_label, tick)
+
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+        tick += 1
+        time.sleep(0.033)
+
+# ==========================================
+# API ENDPOINTS
+# ==========================================
+
+@app.get("/api/stream/register")
+def stream_register():
+    """Plain camera stream for registration tab (no recognition overlay)."""
     return StreamingResponse(
-        build_frame_stream(),
+        frame_generator(recognition=False),
         media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@app.get("/api/stream/live")
+def stream_live():
+    """Camera stream WITH face recognition overlay for attendance tab."""
+    return StreamingResponse(
+        frame_generator(recognition=True),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@app.get("/api/attendance/events")
+def attendance_events():
+    """SSE endpoint — pushes attendance log entries to the frontend in real time."""
+    client_q: queue.Queue = queue.Queue(maxsize=50)
+    with _sse_lock:
+        sse_clients.append(client_q)
+
+    def event_stream():
+        yield ": connected\n\n"
+        try:
+            while server_alive:
+                try:
+                    payload = client_q.get(timeout=15)
+                    yield f"data: {payload}\n\n"
+                except queue.Empty:
+                    yield ": ping\n\n"
+        finally:
+            with _sse_lock:
+                if client_q in sse_clients:
+                    sse_clients.remove(client_q)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+@app.get("/api/registration/progress")
+def registration_progress():
+    """SSE endpoint — streams capture progress during employee registration."""
+    def progress_stream():
+        yield ": connected\n\n"
+        while server_alive:
+            with reg_lock:
+                snap = dict(reg_status)
+            yield f"data: {json.dumps(snap)}\n\n"
+            if snap["done"] or snap["error"]:
+                break
+            time.sleep(0.3)
+
+    return StreamingResponse(
+        progress_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 @app.post("/api/register")
 def register_employee(payload: RegisterRequest, background_tasks: BackgroundTasks):
-    global current_live_frame
-    cleaned_name = clean_text(payload.name)
-    cleaned_title = clean_display_text(payload.title)
+    """
+    1. Insert employee record into DB
+    2. Capture CAPTURE_TARGET face images from live camera
+    3. Upload each image to Supabase Storage bucket
+    4. Trigger model re-sync in background
+    """
+    global current_frame
 
-    if not cleaned_name or not cleaned_title:
-        raise HTTPException(status_code=400, detail="Name and Title fields cannot be blank.")
+    with _frame_lock:
+        frame_check = current_frame
 
-    # Safety catch to ensure user is running the web stream interface
-    if current_live_frame is None:
-        raise HTTPException(status_code=503, detail="Active live stream feed required to parse biometric data.")
+    if frame_check is None:
+        raise HTTPException(503, "Camera feed not available. Please wait and try again.")
 
+    clean_name  = payload.name.strip()
+    clean_title = payload.title.strip()
+    folder      = slugify(clean_name)
+
+    # Insert into DB
     try:
-        inserted = supabase.table(DATABASE_TABLE).insert(
-            {"name": cleaned_name, "title": cleaned_title}
+        result = supabase.table(EMPLOYEES_TABLE).insert(
+            {"name": clean_name, "title": clean_title}
         ).execute()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database record generation failed: {exc}")
+    except Exception as e:
+        raise HTTPException(500, f"Database insert failed: {e}")
 
-    inserted_rows = inserted.data or []
-    if not inserted_rows:
-        raise HTTPException(status_code=500, detail="Employee record not returned.")
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(500, "No row returned after insert.")
+    emp_id = int(rows[0]["id"])
 
-    employee_id = int(inserted_rows[0]["id"])
-    bucket = supabase.storage.from_(SUPABASE_BUCKET)
-    captured_faces: List[bytes] = []
+    # Reset progress
+    with reg_lock:
+        reg_status.update({"active": True, "captured": 0,
+                           "target": CAPTURE_TARGET, "done": False, "error": ""})
 
-    print(f"Starting biometric extraction loop for employee ID: {employee_id}")
+    bucket   = supabase.storage.from_(SUPABASE_BUCKET)
+    captured: List[bytes] = []
 
-    # Seamless extraction from stream matrix instead of locking physical hardware resources
-    for check_cycle in range(40):
-        if len(captured_faces) >= 15: 
-            break
+    print(f"[Register] Capturing faces for '{clean_name}' (id={emp_id})...")
 
-        frame = current_live_frame.copy() if current_live_frame is not None else None
+    # Detection stages: try strict first, fall back to looser if face is missed
+    detect_stages = [
+        {"scaleFactor": 1.1,  "minNeighbors": 4, "minSize": (50, 50)},
+        {"scaleFactor": 1.1,  "minNeighbors": 3, "minSize": (40, 40)},
+        {"scaleFactor": 1.05, "minNeighbors": 2, "minSize": (30, 30)},
+    ]
+
+    deadline = time.time() + CAPTURE_TIMEOUT
+
+    while len(captured) < CAPTURE_TARGET and time.time() < deadline:
+        with _frame_lock:
+            frame = current_frame.copy() if current_frame is not None else None
         if frame is None:
-            time.sleep(0.05)
+            time.sleep(0.01)
             continue
 
+        # Equalise histogram to handle dark/bright lighting
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        gray = cv2.equalizeHist(gray)
 
-        face_box = choose_largest_face(faces)
-        if face_box is not None:
-            x, y, w, h = clamp_box(face_box, frame.shape[1], frame.shape[0])
-            face_crop = frame[y : y + h, x : x + w]
-            if face_crop.size > 0:
-                face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                face_gray = cv2.resize(face_gray, FACE_IMAGE_SIZE)
-                success, encoded = cv2.imencode(".jpg", face_gray)
-                if success:
-                    captured_faces.append(encoded.tobytes())
-        
-        # Short timeout to yield to context worker thread and allow new camera frames to enter memory buffer
-        time.sleep(0.06)
+        # Try each detection stage until a face is found
+        faces = np.array([])
+        for stage in detect_stages:
+            faces = face_cascade.detectMultiScale(gray, **stage)
+            if len(faces) > 0:
+                break
 
-    print(f"Total biometric frames extracted safely: {len(captured_faces)}")
+        if len(faces) > 0:
+            fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            fx, fy, fw, fh = clamp((fx, fy, fw, fh), frame.shape[1], frame.shape[0])
+            crop = frame[fy: fy + fh, fx: fx + fw]
+            if crop.size > 0:
+                crop_resized = cv2.resize(crop, FACE_IMG_SIZE)
+                ok, buf = cv2.imencode(".jpg", crop_resized,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    captured.append(buf.tobytes())
+                    with reg_lock:
+                        reg_status["captured"] = len(captured)
 
-    if not captured_faces:
-        raise HTTPException(status_code=400, detail="Could not capture signature frames. Ensure face remains visible within view.")
+        time.sleep(0.01)
 
-    # Upload clean arrays directly to storage directory bucket matching user name reference
-    for index, face_bytes in enumerate(captured_faces, start=1):
-        object_path = f"{cleaned_name}/face_{index}.jpg"
+    print(f"[Register] Captured {len(captured)} face images in {CAPTURE_TIMEOUT - max(0.0, deadline - time.time()):.1f}s.")
+
+    if len(captured) < 10:
+        with reg_lock:
+            reg_status.update({"active": False, "error": "No face detected during capture."})
+        # Roll back DB insert
         try:
-            bucket.upload(object_path, face_bytes, file_options={"content-type": "image/jpeg", "upsert": "true"})
-        except Exception as upload_err:
-            print(f"Failed to push avatar object index {index}: {upload_err}")
-            continue
+            supabase.table(EMPLOYEES_TABLE).delete().eq("id", emp_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(400, f"Only {len(captured)} face frames captured. Ensure your face is clearly visible and try again.")
 
-    print("Biometric profiles loaded into cloud database bucket successfully.")
-    background_tasks.add_task(sync_employee_models)
-    return {"message": "Success", "employee_id": employee_id}
+    # Upload to Supabase Storage
+    upload_ok = 0
+    for i, img_bytes in enumerate(captured, start=1):
+        path = f"{folder}/face_{i}.jpg"
+        try:
+            bucket.upload(path, img_bytes,
+                          file_options={"content-type": "image/jpeg", "upsert": "true"})
+            upload_ok += 1
+        except Exception as e:
+            print(f"[Register] Upload failed for {path}: {e}")
+
+    print(f"[Register] Uploaded {upload_ok}/{len(captured)} images to bucket.")
+
+    with reg_lock:
+        reg_status.update({"active": False, "done": True, "captured": len(captured)})
+
+    background_tasks.add_task(sync_models)
+    return {
+        "message":     "Registration successful",
+        "employee_id": emp_id,
+        "images_saved": upload_ok,
+    }
+
+@app.get("/api/employees")
+def list_employees():
+    """Return all registered employees."""
+    try:
+        rows = supabase.table(EMPLOYEES_TABLE).select("id,name,title").execute().data or []
+        return {"employees": rows}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    try:
+        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    finally:
+        server_alive = False
