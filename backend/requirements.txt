@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+supabase
+opencv-contrib-python
+numpy
+pydantic
+#face_recognition
